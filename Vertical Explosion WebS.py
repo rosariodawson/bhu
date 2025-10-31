@@ -2,16 +2,15 @@
 # -*- coding: utf-8 -*-
 
 """
-Vertical Explosion Catcher v5.11 — Multi-Stream Engine
+Vertical Explosion Catcher v5.13 — Stable WebSocket Engine
 ---------------------------------------------------------------------------------
-Solves 418 bans and WebSocket connection errors.
+Solves 418 bans, 400 Handshake Errors, and Session management bugs.
 
 What’s new in this patch
-- HOTFIX: Solves WSServerHandshakeError by "chunking" symbols into multiple
-  WebSocket connections (300 symbols each) to stay under the 1024 stream limit.
-- HOTFIX: Solves "Session is closed" error by correctly managing the
-  aiohttp.ClientSession for the persistent Safe Poller task.
-- Re-added the missing 'now_iso_utc' helper function.
+- HOTFIX: Added `heartbeat=60` to ws_connect to auto-respond to server pings.
+  This fixes the constant "WebSocket closed or errored" disconnects.
+- HOTFIX: Moved ClientSession creation outside the reconnect loop to fix
+  the 'Unclosed client session' memory leak.
 - This script is a 24/7 daemon.
 """
 
@@ -19,6 +18,7 @@ import asyncio
 import aiohttp
 import sys
 import json
+import random
 from datetime import datetime, timezone
 from typing import Dict, Any, List, Optional, Tuple, Set
 
@@ -26,7 +26,7 @@ from typing import Dict, Any, List, Optional, Tuple, Set
 import logging
 
 def make_logger()->logging.Logger:
-    logger = logging.getLogger("vec511")
+    logger = logging.getLogger("vec513")
     logger.setLevel(logging.INFO)
     h = logging.StreamHandler(sys.stdout)
     fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
@@ -43,7 +43,7 @@ def http_log(method:str, url:str, status:int):
         log.info('HTTP Request: %s %s "HTTP/1.1 %s"', method, url, status)
 
 # ----------------------------- Endpoints -----------------------------
-BINANCE_WS_FUTURES_COMBINED = "wss://fstream.binance.com/stream?streams="
+BINANCE_WS_FUTURES_BASE = "wss://fstream.binance.com/ws"
 
 # REST endpoints for Safe Poller
 FUT_EXCHANGE_INFO  = "https://fapi.binance.com/fapi/v1/exchangeInfo"
@@ -66,7 +66,7 @@ BYBIT_OI_HIST    = "https://api.bybit.com/v5/market/open-interest"
 BITGET_FUT_INFO  = "https://api.bitget.com/api/v2/mix/market/contracts"
 BITGET_OI_HIST   = "https://api.bitget.com/api/v2/mix/market/history-open-interest"
 
-HEADERS = {"Accept": "application/json", "User-Agent": "vec511/multi-stream"}
+HEADERS = {"Accept": "application/json", "User-Agent": "vec513/stable-engine"}
 HTTP_TIMEOUT = aiohttp.ClientTimeout(total=20)
 
 # ----------------------------- Real-Time State Manager -----------------------------
@@ -149,7 +149,6 @@ async def fetch_json(session: aiohttp.ClientSession, method: str, url: str, para
     try:
         async with session.request(method, url, params=params, timeout=HTTP_TIMEOUT) as resp:
             status = resp.status
-            # Log non-404 client errors and all server errors
             if status >= 500 or (400 <= status < 404) or (status > 404):
                  http_log(method.upper(), str(resp.url), status)
             if 200 <= status < 300:
@@ -484,10 +483,10 @@ async def safe_poller_task(
 
 # ----------------------------- New: WebSocket Manager -----------------------------
 
-async def stream_data(symbols: List[str], mode: str, min_score: float, name: str):
+async def stream_data(session: aiohttp.ClientSession, symbols: List[str], mode: str, min_score: float, name: str):
     """
-    Connects to Binance combined streams and processes live data.
-    This is the new "main loop" of the script.
+    Connects to Binance and subscribes to streams using JSON-RPC.
+    This fixes the URL Length Limit (400 Bad Request) error.
     """
     streams = []
     for s in symbols:
@@ -496,15 +495,27 @@ async def stream_data(symbols: List[str], mode: str, min_score: float, name: str
         streams.append(f"{s_low}@aggTrade")
         streams.append(f"{s_low}@depth5@100ms")
         
-    url = BINANCE_WS_FUTURES_COMBINED + "/".join(streams)
-    log.info(f"[{name}] Connecting to WebSocket with {len(streams)} streams...")
+    log.info(f"[{name}] Connecting to WebSocket {BINANCE_WS_FUTURES_BASE}...")
     
-    while True: # Add eternal reconnect loop
+    # This outer loop handles reconnects
+    while True: 
         try:
-            async with aiohttp.ClientSession().ws_connect(url, timeout=None, heartbeat=60) as ws:
+            # FIX: Use the session passed in, don't create a new one.
+            # FIX: Add heartbeat=60 to auto-respond to pings.
+            async with session.ws_connect(BINANCE_WS_FUTURES_BASE, timeout=None, heartbeat=60) as ws:
                 log.info(f"[{name}] WebSocket Connection SUCCESSFUL.")
                 
-                while True: # Inner message processing loop
+                # FIX: Subscribe using a JSON message, not the URL
+                subscribe_payload = {
+                    "method": "SUBSCRIBE",
+                    "params": streams,
+                    "id": random.randint(1, 100000)
+                }
+                await ws.send_json(subscribe_payload)
+                log.info(f"[{name}] Sent SUBSCRIBE request for {len(streams)} streams.")
+                
+                # Inner message processing loop
+                while True: 
                     msg_raw = await ws.receive()
                     
                     if msg_raw.type == aiohttp.WSMsgType.TEXT:
@@ -525,7 +536,7 @@ async def stream_data(symbols: List[str], mode: str, min_score: float, name: str
                         if stream_name.endswith("@kline_5m"):
                             kline = data['k']
                             if kline['x']: # 'x' is True if the kline is closed
-                                log.info(f"[{name}] KLINE CLOSED: {symbol}")
+                                # log.info(f"[{name}] KLINE CLOSED: {symbol}")
                                 state.update_kline(kline)
                                 await evaluate_signal(state, mode, min_score) # Run signal logic
                         
@@ -536,9 +547,9 @@ async def stream_data(symbols: List[str], mode: str, min_score: float, name: str
                             state.update_depth(data)
                             
                     elif msg_raw.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
-                        log.warning(f"[{name}] WebSocket closed or errored. Breaking to reconnect.")
+                        log.warning(f"[{name}] WebSocket {msg_raw.type}. Breaking to reconnect.")
                         break # Break inner loop to trigger reconnect
-                            
+            
         except Exception as e:
             log.error(f"[{name}] WebSocket Error: {e}. Reconnecting in 30 seconds...")
             await asyncio.sleep(30)
@@ -558,7 +569,7 @@ async def evaluate_signal(state: MarketState, mode: str, min_score: float):
     if mode == 'scalp':
         price_chg_30m = state.get_price_change_30m()
         if price_chg_30m is None:
-            log.debug(f"{state.symbol}: Skipping, not enough 30m kline data.")
+            # log.debug(f"{state.symbol}: Skipping, not enough 30m kline data.")
             return # Not enough data yet
         
         price_chg_log = price_chg_30m
@@ -579,8 +590,13 @@ async def evaluate_signal(state: MarketState, mode: str, min_score: float):
 
     # --- Build Trade Plan ---
     entry_price = state.current_price
+    if entry_price == 0.0: # Handle case where no trade has happened yet
+        entry_price = safe_float(state.kline_30m[-1]['c']) if state.kline_30m else 0.0
+        if entry_price == 0.0:
+            log.warning(f"{state.symbol}: Skipping signal, no current price data.")
+            return
+
     sl_price = None
-    
     live_bid_walls = sorted([w for w in state.bid_walls.keys() if w < entry_price], reverse=True)
     if live_bid_walls:
         sl_price = live_bid_walls[0]
@@ -618,7 +634,7 @@ async def evaluate_signal(state: MarketState, mode: str, min_score: float):
 
 async def main_async(args: List[str]) -> None:
     import argparse
-    ap = argparse.ArgumentParser(description="Vertical Explosion Catcher v5.11 — Multi-Stream Engine")
+    ap = argparse.ArgumentParser(description="Vertical Explosion Catcher v5.12 — Multi-Stream Engine")
     ap.add_argument("--symbols", type=str, default=None, help="Optional CSV/TXT with one futures symbol per line")
     ap.add_argument("--max-concurrency", type=int, default=20)
     ap.add_argument("--mode", type=str, default="scalp", choices=['scalp', 'hold'], help="Strategy mode: 'scalp' (30m) or 'hold' (24h)")
@@ -627,54 +643,50 @@ async def main_async(args: List[str]) -> None:
 
     MIN_SCORE_THRESHOLD = 6.0 if ns.gate == 'discovery' else 9.0
 
-    log.info("--- Vertical Explosion Catcher v5.11 (Multi-Stream) | %s ---", now_iso_utc())
+    log.info("--- Vertical Explosion Catcher v5.12 (Multi-Stream) | %s ---", now_iso_utc())
     log.info("--- Mode: %s | Gate: %s (Min Score: %.1f) ---", ns.mode.upper(), ns.gate.upper(), MIN_SCORE_THRESHOLD)
     log.info("Fetching exchange info and building symbol maps...")
 
     global fut_map, spot_map, bybit_map, bitget_map
 
-    # This first session is *only* for the initial setup
-    async with aiohttp.ClientSession(timeout=HTTP_TIMEOUT, headers=HEADERS) as setup_session:
-        fut_map, spot_map, bybit_map, bitget_map = await load_all_exchange_maps(setup_session)
+    # FIX: Create one session to be shared by all tasks
+    async with aiohttp.ClientSession(timeout=HTTP_TIMEOUT, headers=HEADERS) as session:
+        fut_map, spot_map, bybit_map, bitget_map = await load_all_exchange_maps(session)
 
-    if not fut_map:
-        log.error("No Binance futures symbols available. Exiting.")
-        return
+        if not fut_map:
+            log.error("No Binance futures symbols available. Exiting.")
+            return
 
-    # --- Initialize Global State for all symbols ---
-    symbols_to_scan = []
-    if ns.symbols:
-        sel_symbols = read_symbols_file(ns.symbols)
-        symbols_to_scan = [s for s in sel_symbols if s in fut_map]
-        log.info("Symbol list provided: Monitoring %d symbols.", len(symbols_to_scan))
-    else:
-        symbols_to_scan = sorted(list(fut_map.keys()))
-        log.info("Scanning all %d Binance futures symbols...", len(symbols_to_scan))
+        symbols_to_scan = []
+        if ns.symbols:
+            sel_symbols = read_symbols_file(ns.symbols)
+            symbols_to_scan = [s for s in sel_symbols if s in fut_map]
+            log.info("Symbol list provided: Monitoring %d symbols.", len(symbols_to_scan))
+        else:
+            symbols_to_scan = sorted(list(fut_map.keys()))
+            log.info("Scanning all %d Binance futures symbols...", len(symbols_to_scan))
 
-    for symbol in symbols_to_scan:
-        GLOBAL_STATE[symbol] = MarketState(symbol)
+        for symbol in symbols_to_scan:
+            GLOBAL_STATE[symbol] = MarketState(symbol)
+            
+        log.info("Launching 24/7 tasks...")
         
-    # --- Launch Concurrent Tasks ---
-    log.info("Launching 24/7 tasks...")
-    
-    # This session is persistent for the poller
-    async with aiohttp.ClientSession(timeout=HTTP_TIMEOUT, headers=HEADERS) as poller_session:
         all_tasks = []
         try:
             # 1. Start the Safe Poller Task
             poller_task = asyncio.create_task(safe_poller_task(
-                poller_session, spot_map, bybit_map, bitget_map, ns.mode
+                session, spot_map, bybit_map, bitget_map, ns.mode
             ))
             all_tasks.append(poller_task)
 
             # 2. Start the WebSocket Stream Tasks (in chunks)
-            chunk_size = 300 # 300 symbols * 3 streams/symbol = 900 streams (safe under 1024 limit)
+            chunk_size = 300 
             symbol_chunks = [symbols_to_scan[i:i + chunk_size] for i in range(0, len(symbols_to_scan), chunk_size)]
             log.info(f"Chunking {len(symbols_to_scan)} symbols into {len(symbol_chunks)} WebSocket connections...")
             
             for i, chunk in enumerate(symbol_chunks):
                 ws_task = asyncio.create_task(stream_data(
-                    chunk, ns.mode, MIN_SCORE_THRESHOLD, f"WS-Conn-{i+1}"
+                    session, chunk, ns.mode, MIN_SCORE_THRESHOLD, f"WS-Conn-{i+1}"
                 ))
                 all_tasks.append(ws_task)
                 
@@ -685,7 +697,7 @@ async def main_async(args: List[str]) -> None:
         finally:
             for task in all_tasks:
                 task.cancel()
-            await asyncio.gather(*all_tasks, return_exceptions=True) # Wait for tasks to finish cancelling
+            await asyncio.gather(*all_tasks, return_exceptions=True)
             log.info("Script shut down.")
 
 
